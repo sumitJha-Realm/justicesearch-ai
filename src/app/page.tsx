@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import Header from "@/components/Header";
 import SearchBar from "@/components/SearchBar";
 import FiltersSidebar from "@/components/FiltersSidebar";
 import ResultCard from "@/components/ResultCard";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import QueryMetrics, { QueryMetricsData } from "@/components/QueryMetrics";
+import IngestPDF from "@/components/IngestPDF";
 import { Judgment } from "@/data/judgments";
 import { SearchFilters } from "@/lib/search";
 import {
@@ -31,15 +32,27 @@ export default function Home() {
   const [filters, setFilters] = useState<SearchFilters>({});
   const [lastQuery, setLastQuery] = useState("");
   const [lastMode, setLastMode] = useState<"keyword" | "semantic">("keyword");
+  const [showIngest, setShowIngest] = useState(false);
+  const [docCount, setDocCount] = useState<number | null>(null);
 
-  const handleSearch = useCallback(async (query: string, mode: "keyword" | "semantic") => {
+  const refreshDocCount = useCallback(() => {
+    fetch("/api/analytics")
+      .then(r => r.json())
+      .then(d => setDocCount(d.summary?.totalJudgments ?? null))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { refreshDocCount(); }, [refreshDocCount]);
+
+  const handleSearch = useCallback(async (query: string, mode: "keyword" | "semantic", overrideFilters?: SearchFilters) => {
+    const f = overrideFilters ?? filters;
     setIsLoading(true); setLastQuery(query); setLastMode(mode);
     try {
       const params = new URLSearchParams({ q: query, mode });
-      if (filters.courtLevel?.length) params.set("courtLevel", filters.courtLevel.join(","));
-      if (filters.yearRange) { params.set("yearMin", filters.yearRange[0].toString()); params.set("yearMax", filters.yearRange[1].toString()); }
-      if (filters.disposition?.length) params.set("disposition", filters.disposition.join(","));
-      if (filters.category?.length) params.set("category", filters.category.join(","));
+      if (f.courtLevel?.length) params.set("courtLevel", f.courtLevel.join(","));
+      if (f.yearRange) { params.set("yearMin", f.yearRange[0].toString()); params.set("yearMax", f.yearRange[1].toString()); }
+      if (f.disposition?.length) params.set("disposition", f.disposition.join(","));
+      if (f.category?.length) params.set("category", f.category.join(","));
       const res = await fetch(`/api/search?${params.toString()}`);
       const data = await res.json();
       setSearchResults(data);
@@ -69,13 +82,21 @@ export default function Home() {
   const handleFiltersChange = useCallback((newFilters: SearchFilters) => {
     setFilters(newFilters);
     if (lastQuery && lastQuery !== "AI Precedent Search") {
-      setTimeout(() => handleSearch(lastQuery, lastMode), 100);
+      // Pass newFilters directly so handleSearch doesn't use stale closure
+      handleSearch(lastQuery, lastMode, newFilters);
     }
   }, [lastQuery, lastMode, handleSearch]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC]">
-      <Header activeTab={activeTab} onTabChange={setActiveTab} />
+      <Header activeTab={activeTab} onTabChange={setActiveTab} onIngestClick={() => setShowIngest(true)} docCount={docCount} />
+
+      {showIngest && (
+        <IngestPDF
+          onClose={() => setShowIngest(false)}
+          onIngested={refreshDocCount}
+        />
+      )}
 
       <main className="flex-1 max-w-[1400px] mx-auto w-full px-6 py-8">
         {activeTab === "search" ? (

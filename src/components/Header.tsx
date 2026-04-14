@@ -1,22 +1,16 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Scale, Database, Search, BarChart3 } from "lucide-react";
+
+import { Scale, Database, Search, BarChart3, Upload } from "lucide-react";
 
 interface HeaderProps {
   activeTab: "search" | "analytics";
   onTabChange: (tab: "search" | "analytics") => void;
+  onIngestClick: () => void;
+  docCount?: number | null;
 }
 
-export default function Header({ activeTab, onTabChange }: HeaderProps) {
-  const [docCount, setDocCount] = useState<number | null>(null);
-
-  useEffect(() => {
-    fetch("/api/analytics")
-      .then(r => r.json())
-      .then(d => setDocCount(d.summary?.totalJudgments ?? null))
-      .catch(() => {});
-  }, []);
+export default function Header({ activeTab, onTabChange, onIngestClick, docCount }: HeaderProps) {
 
   return (
     <header className="sticky top-0 z-50 bg-[#0F172A] shadow-[0_1px_3px_rgba(0,0,0,0.3)]">
@@ -43,6 +37,13 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
 
           {/* Badges */}
           <div className="hidden md:flex items-center gap-3">
+            <button
+              onClick={onIngestClick}
+              className="flex items-center gap-2 bg-gradient-to-r from-orange-500/20 to-red-500/20 border border-orange-500/30 hover:border-orange-400/50 px-3.5 py-1.5 rounded-full transition-all hover:shadow-lg hover:shadow-orange-500/10 group"
+            >
+              <Upload className="w-3.5 h-3.5 text-orange-400 group-hover:text-orange-300 transition-colors" />
+              <span className="text-[12px] text-orange-300 font-semibold group-hover:text-orange-200 transition-colors">Ingest PDF</span>
+            </button>
             <div className="flex items-center gap-2 bg-white/[0.06] border border-white/[0.08] px-3.5 py-1.5 rounded-full">
               <Database className="w-3.5 h-3.5 text-emerald-400" />
               <span className="text-[12px] text-slate-300 font-medium">MongoDB Atlas</span>

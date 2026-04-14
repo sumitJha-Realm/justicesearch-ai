@@ -101,27 +101,16 @@ async function mongoSearch(query: string, mode: string, filters: SearchFilters) 
     },
   });
 
-  // ── Build compound filter clauses for Atlas Search ──
-  const filterClauses: Record<string, unknown>[] = [];
+  // ── $search stage (text relevance only — no filter here) ──
+  // courtLevel, category, disposition are stringFacet in the index,
+  // so we cannot use the text operator on them inside $search.
+  // We apply those filters as a $match stage AFTER $search.
 
-  if (filters.courtLevel?.length) {
-    filterClauses.push({
-      text: { query: filters.courtLevel, path: "courtLevel" },
-    });
-  }
-  if (filters.disposition?.length) {
-    filterClauses.push({
-      text: { query: filters.disposition, path: "disposition" },
-    });
-  }
+  // Only year range can go inside $search (it's indexed as number).
+  const filterClauses: Record<string, unknown>[] = [];
   if (filters.yearRange) {
     filterClauses.push({
       range: { path: "year", gte: filters.yearRange[0], lte: filters.yearRange[1] },
-    });
-  }
-  if (filters.category?.length) {
-    filterClauses.push({
-      text: { query: filters.category, path: "category" },
     });
   }
 
@@ -136,8 +125,26 @@ async function mongoSearch(query: string, mode: string, filters: SearchFilters) 
     },
   };
 
-  const pipeline = [
+  // ── Post-search $match for stringFacet fields ──
+  const postMatchFilter: Record<string, unknown> = {};
+  if (filters.courtLevel?.length) {
+    postMatchFilter.courtLevel = { $in: filters.courtLevel };
+  }
+  if (filters.disposition?.length) {
+    postMatchFilter.disposition = { $in: filters.disposition };
+  }
+  if (filters.category?.length) {
+    // Sidebar sends broad categories like "Criminal", "Constitutional"
+    // but DB has "Criminal - Bail", "Constitutional - Fundamental Rights" etc.
+    // Use regex to match the prefix.
+    const catRegex = filters.category.map(c => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    postMatchFilter.category = { $regex: `^(${catRegex})`, $options: "i" };
+  }
+
+  const pipeline: Record<string, unknown>[] = [
     searchStage,
+    // Apply post-search filters if any
+    ...(Object.keys(postMatchFilter).length > 0 ? [{ $match: postMatchFilter }] : []),
     {
       $addFields: {
         searchScore: { $meta: "searchScore" },
@@ -162,11 +169,18 @@ async function mongoSearch(query: string, mode: string, filters: SearchFilters) 
   const searchTime = Math.round(endTime - startTime);
 
   // Build pipeline description for metrics
+  const activeFilters = [
+    ...(filters.courtLevel?.length ? [`courtLevel: ${filters.courtLevel.join(", ")}`] : []),
+    ...(filters.disposition?.length ? [`disposition: ${filters.disposition.join(", ")}`] : []),
+    ...(filters.category?.length ? [`category: ${filters.category.join(", ")}`] : []),
+    ...(filters.yearRange ? [`year: ${filters.yearRange[0]}–${filters.yearRange[1]}`] : []),
+  ];
   const pipelineDesc = [
     `$search (index: judgment_search, compound)`,
     `  should: fuzzy (maxEdits:2)${mode === "semantic" ? " + synonyms (legal_synonyms)" : ""}`,
     `  should: phrase boost (caseTitle, headnotes)`,
-    ...(filterClauses.length > 0 ? [`  filter: ${filterClauses.length} clause(s)`] : []),
+    ...(filterClauses.length > 0 ? [`  filter: year range`] : []),
+    ...(Object.keys(postMatchFilter).length > 0 ? [`$match (${activeFilters.join(", ")})`] : []),
     `$addFields (searchScore, matchScore)`,
     `$project (-embedding)`,
     `$limit 50`,
