@@ -1,7 +1,7 @@
 import { MongoClient, Db } from "mongodb";
 
-const MONGODB_URI = process.env.MONGODB_URI || "";
-const MONGODB_DB = process.env.MONGODB_DB || "justicesearch";
+const MONGODB_URI = (process.env.MONGODB_URI || "").trim();
+const MONGODB_DB = (process.env.MONGODB_DB || "justicesearch").trim();
 
 if (!MONGODB_URI) {
   console.warn(

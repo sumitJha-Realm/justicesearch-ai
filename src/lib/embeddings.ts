@@ -16,8 +16,8 @@
  *   }
  */
 
-const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY || "";
-const VOYAGE_MODEL = process.env.VOYAGE_MODEL || "voyage-law-2";
+const VOYAGE_API_KEY = (process.env.VOYAGE_API_KEY || "").trim();
+const VOYAGE_MODEL = (process.env.VOYAGE_MODEL || "voyage-law-2").trim();
 const VOYAGE_BASE_URL = "https://ai.mongodb.com/v1/embeddings";
 
 // Dimensions per model
