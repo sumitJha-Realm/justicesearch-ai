@@ -57,72 +57,136 @@ async function mongoSearch(query: string, mode: string, filters: SearchFilters) 
   const { db } = await connectToDatabase();
   const collection = db.collection("judgments");
 
-  // Build MongoDB text search filter
-  const searchTerms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const regex = searchTerms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  const textFilter = {
-    $or: [
-      { caseTitle: { $regex: regex, $options: "i" } },
-      { headnotes: { $regex: regex, $options: "i" } },
-      { fullText: { $regex: regex, $options: "i" } },
-      { category: { $regex: regex, $options: "i" } },
-      { tags: { $regex: regex, $options: "i" } },
-      { acts: { $regex: regex, $options: "i" } },
-      { sections: { $regex: regex, $options: "i" } },
-      { snippet: { $regex: regex, $options: "i" } },
-    ],
-  };
+  // ── Build $search stage using judgment_search Atlas Search index ──
+  const searchTextFields = [
+    { path: "caseTitle", score: { boost: { value: 5 } } },
+    { path: "headnotes", score: { boost: { value: 4 } } },
+    { path: "tags", score: { boost: { value: 3 } } },
+    { path: "acts", score: { boost: { value: 2 } } },
+    { path: "fullText", score: { boost: { value: 1 } } },
+  ];
 
-  // Apply additional filters
-  const matchFilters: Record<string, unknown>[] = [textFilter];
-  if (filters.courtLevel?.length) matchFilters.push({ courtLevel: { $in: filters.courtLevel } });
-  if (filters.yearRange) matchFilters.push({ year: { $gte: filters.yearRange[0], $lte: filters.yearRange[1] } });
-  if (filters.disposition?.length) matchFilters.push({ disposition: { $in: filters.disposition } });
-  if (filters.category?.length) {
-    const catRegex = filters.category.map(c => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-    matchFilters.push({ category: { $regex: catRegex, $options: "i" } });
-  }
+  // Keyword mode: fuzzy matching (tolerates typos)
+  // Semantic mode: synonym-aware text search (uses legal_synonyms mapping)
+  const shouldClauses = [];
 
-  const results = await collection
-    .find({ $and: matchFilters })
-    .project({ embedding: 0 })
-    .limit(50)
-    .toArray();
-
-  // Score results based on match quality
-  const scored = results.map((doc) => {
-    let score = 0;
-    const d = doc as unknown as Judgment;
-    for (const term of searchTerms) {
-      const tl = term.toLowerCase();
-      if (d.caseTitle?.toLowerCase().includes(tl)) score += 30;
-      if (d.headnotes?.toLowerCase().includes(tl)) score += 25;
-      if (d.tags?.some((t: string) => t.toLowerCase().includes(tl))) score += 20;
-      if (d.acts?.some((a: string) => a.toLowerCase().includes(tl))) score += 15;
-      if (d.fullText?.toLowerCase().includes(tl)) score += 10;
-    }
-    return { ...doc, _id: doc.sourceId || doc._id?.toString(), matchScore: Math.min(Math.round(score / searchTerms.length), 99) };
+  // Fuzzy text clause (handles typos like "hormocide" → "homicide")
+  shouldClauses.push({
+    text: {
+      query,
+      path: searchTextFields.map(f => f.path),
+      fuzzy: { maxEdits: 2, prefixLength: 2 },
+      score: { boost: { value: mode === "keyword" ? 3 : 1 } },
+    },
   });
 
-  scored.sort((a, b) => b.matchScore - a.matchScore);
-  if (mode === "semantic") scored.forEach(r => { r.matchScore = Math.min(r.matchScore + 15, 99); });
+  // Synonym-aware clause (uses legal_synonyms collection)
+  if (mode === "semantic") {
+    shouldClauses.push({
+      text: {
+        query,
+        path: searchTextFields.map(f => f.path),
+        synonyms: "legal_synonyms",
+        score: { boost: { value: 4 } },
+      },
+    });
+  }
+
+  // Exact phrase boost
+  shouldClauses.push({
+    phrase: {
+      query,
+      path: ["caseTitle", "headnotes"],
+      score: { boost: { value: 10 } },
+    },
+  });
+
+  // ── Build compound filter clauses for Atlas Search ──
+  const filterClauses: Record<string, unknown>[] = [];
+
+  if (filters.courtLevel?.length) {
+    filterClauses.push({
+      text: { query: filters.courtLevel, path: "courtLevel" },
+    });
+  }
+  if (filters.disposition?.length) {
+    filterClauses.push({
+      text: { query: filters.disposition, path: "disposition" },
+    });
+  }
+  if (filters.yearRange) {
+    filterClauses.push({
+      range: { path: "year", gte: filters.yearRange[0], lte: filters.yearRange[1] },
+    });
+  }
+  if (filters.category?.length) {
+    filterClauses.push({
+      text: { query: filters.category, path: "category" },
+    });
+  }
+
+  const searchStage: Record<string, unknown> = {
+    $search: {
+      index: "judgment_search",
+      compound: {
+        should: shouldClauses,
+        minimumShouldMatch: 1,
+        ...(filterClauses.length > 0 ? { filter: filterClauses } : {}),
+      },
+    },
+  };
+
+  const pipeline = [
+    searchStage,
+    {
+      $addFields: {
+        searchScore: { $meta: "searchScore" },
+        matchScore: {
+          $min: [{ $round: [{ $multiply: [{ $meta: "searchScore" }, 10] }, 0] }, 99],
+        },
+      },
+    },
+    { $project: { embedding: 0 } },
+    { $limit: 50 },
+  ];
+
+  const results = await collection.aggregate(pipeline).toArray();
+
+  // Map _id for client
+  const mapped = results.map((doc) => ({
+    ...doc,
+    _id: doc.sourceId || doc._id?.toString(),
+  }));
 
   const endTime = performance.now();
   const searchTime = Math.round(endTime - startTime);
 
+  // Build pipeline description for metrics
+  const pipelineDesc = [
+    `$search (index: judgment_search, compound)`,
+    `  should: fuzzy (maxEdits:2)${mode === "semantic" ? " + synonyms (legal_synonyms)" : ""}`,
+    `  should: phrase boost (caseTitle, headnotes)`,
+    ...(filterClauses.length > 0 ? [`  filter: ${filterClauses.length} clause(s)`] : []),
+    `$addFields (searchScore, matchScore)`,
+    `$project (-embedding)`,
+    `$limit 50`,
+  ];
+
   return {
-    results: scored,
-    totalResults: scored.length,
+    results: mapped,
+    totalResults: mapped.length,
     searchTime,
     searchMode: mode,
     metrics: {
-      query, searchMode: mode,
-      engine: "MongoDB Atlas",
-      totalResults: scored.length,
+      query,
+      searchMode: mode,
+      engine: mode === "semantic" ? "Atlas Search + Synonyms" : "Atlas Search + Fuzzy",
+      totalResults: mapped.length,
       searchTime,
-      database: "justicesearch", collection: "judgments",
-      indexUsed: "$regex (text match)",
-      pipelineStages: ["$match ($regex)", "$project (-embedding)", "$limit 50", "client-side scoring"],
+      database: "justicesearch",
+      collection: "judgments",
+      indexUsed: "judgment_search",
+      pipelineStages: pipelineDesc,
     },
   };
 }
